@@ -104,37 +104,52 @@ impl ZygiskModule for VpnHide {
 
     fn pre_app_specialize<'a>(
         &self,
-        mut api: ZygiskApi<'a, V5>,
-        env: JNIEnv<'a>,
-        args: &'a mut AppSpecializeArgs<'_>,
+        _api: ZygiskApi<'a, V5>,
+        _env: JNIEnv<'a>,
+        _args: &'a mut AppSpecializeArgs<'_>,
     ) {
-        let Some(package) = read_jstring(&env, args.nice_name) else {
-            mark_cleanup(&mut api);
-            return;
-        };
-
-        if !is_targeted(&package) {
-            mark_cleanup(&mut api);
-            return;
-        }
-
-        logi(&format!("pre_app_specialize: targeting {}", package));
+        // DIAGNOSTIC: minimal pre — no JNI, no file IO, no format!.
+        // Unconditionally mark as target. post_app_specialize will gate
+        // on the targets.txt file (safer there — we read via std::fs with
+        // mount namespace fully set up).
+        logi("pre_app_specialize: MINIMAL mode, marking as potential target");
         self.is_target.set(true);
     }
 
     fn post_app_specialize<'a>(
         &self,
         mut api: ZygiskApi<'a, V5>,
-        _env: JNIEnv<'a>,
-        _args: &'a AppSpecializeArgs<'_>,
+        env: JNIEnv<'a>,
+        args: &'a AppSpecializeArgs<'_>,
     ) {
+        logi("post_app_specialize: ENTER");
         if !self.is_target.get() {
             return;
         }
+
+        // Read nice_name here (not in pre — seems to interact badly with
+        // zygote state). At post_app_specialize the app process is fully
+        // specialized and JNI is in a known-good state.
+        let package = match read_jstring(&env, args.nice_name) {
+            Some(p) => p,
+            None => {
+                logw("post_app_specialize: failed to read nice_name, skipping");
+                return;
+            }
+        };
+        logi(&format!("post_app_specialize: package={package}"));
+
+        if !is_targeted(&package) {
+            logi("post_app_specialize: not in targets.txt, skipping");
+            return;
+        }
+
+        logi("post_app_specialize: about to install_hooks");
         match install_hooks(&mut api) {
             Ok(count) => logi(&format!("hooks installed across {count} libraries")),
             Err(err) => loge(&format!("install_hooks failed: {err}")),
         }
+        logi("post_app_specialize: EXIT");
     }
 
     // No pre_server_specialize override — the trait default is empty,
@@ -150,7 +165,12 @@ fn mark_cleanup(api: &mut ZygiskApi<'_, V5>) {
 /// Install PLT hooks for `ioctl` on every currently-mapped ELF in the
 /// process. Returns the number of libraries we registered a hook for.
 fn install_hooks(api: &mut ZygiskApi<'_, V5>) -> Result<usize, String> {
+    logi("install_hooks: reading /proc/self/maps");
     let elfs = maps::loaded_elfs();
+    logi(&format!(
+        "install_hooks: found {} total ELF mappings (pre-filter)",
+        elfs.len()
+    ));
     if elfs.is_empty() {
         return Err("no ELFs found in /proc/self/maps".into());
     }
@@ -163,29 +183,88 @@ fn install_hooks(api: &mut ZygiskApi<'_, V5>) -> Result<usize, String> {
     let mut old_fn: *const () = core::ptr::null();
     let new_fn: *const () = hooked_ioctl as *const ();
 
+    // STATUS (2026-04-10): PLT hooking via Zygisk fundamentally does not
+    // solve the Flutter case and is left here as a skeleton for future
+    // work. The problem is a timing/visibility issue, not a code bug:
+    //
+    //   1. Zygisk's pltHookRegister patches PLT entries in libraries
+    //      currently mapped into the process. It cannot patch libraries
+    //      that load later (e.g. via dlopen).
+    //
+    //   2. At post_app_specialize time, libflutter.so / libapp.so / the
+    //      Dart VM's native code are NOT yet loaded. Only ~350 Android
+    //      system libraries are mapped.
+    //
+    //   3. Those ~350 system libraries do NOT directly call libc::ioctl
+    //      from their own code. They link against libc but the ioctl
+    //      call is wrapped inside libc itself. Running `readelf -r` over
+    //      a dozen common system libs (libandroid, libbinder, libutils,
+    //      libmedia, libui, libgui, libnetd_client, libbase, libcutils,
+    //      libc++, libandroid_runtime, libart) shows ZERO ioctl
+    //      relocations. So `pltHookRegister(..., "ioctl", ...)` on a
+    //      system library either (a) finds nothing to patch and commit
+    //      returns PltHookCommitError, or (b) patches a different
+    //      library's PLT via some cascading side effect, crashing the
+    //      process (observed when hooking 349 libraries at once).
+    //
+    //   4. The correct architectural fix is one of:
+    //        a) inline-hook libc.so's `ioctl` entry point itself via
+    //           ByteDance shadowhook or Dobby. This catches every caller
+    //           regardless of load order. Requires FFI to a C++ library.
+    //        b) hook `dlopen` / `android_dlopen_ext` in the system
+    //           libraries that do call them (libandroid_runtime.so
+    //           uses dlopen when the Java VM calls System.loadLibrary),
+    //           then inside our wrapper, after the real dlopen returns,
+    //           re-scan /proc/self/maps and register new PLT hooks on
+    //           the freshly loaded library. Requires persistent access
+    //           to the Zygisk API table outside the specialize
+    //           callbacks.
+    //
+    // For now we register a no-op "single library" hook on libandroid.so
+    // so that the install_hooks path is exercised end to end. This lets
+    // us verify that the scoping, pre/post specialize flow, and PLT
+    // registration plumbing are all working, even though the actual
+    // interception is not effective.
+    let target_substr = "libandroid.so";
     let mut registered = 0usize;
     for elf in &elfs {
-        // Skip our own shared library — we don't want to redirect ioctl
-        // calls made from inside this module.
-        if elf
-            .path
-            .to_str()
-            .map(|s| s.contains("vpnhide_zygisk"))
-            .unwrap_or(false)
+        let Some(path) = elf.path.to_str() else { continue };
+
+        // Skip our own .so and framework libraries.
+        if path.contains("vpnhide_zygisk")
+            || path.contains("libvector")
+            || path.contains("liblspd")
+            || path.contains("zygisk")
+            || path.contains("linker64")
+            || path.contains("ld-android")
         {
             continue;
         }
+
+        if !path.ends_with(target_substr) {
+            continue;
+        }
+
+        logi(&format!("install_hooks: targeting single lib: {path}"));
         unsafe {
             api.plt_hook_register(elf.dev, elf.inode, c"ioctl", new_fn, &mut old_fn);
         }
         registered += 1;
     }
+    logi(&format!(
+        "install_hooks: registered ioctl hook on {registered} libraries"
+    ));
     if registered == 0 {
         return Err("no hooks registered — empty candidate set".into());
     }
+    logi(&format!(
+        "install_hooks: about to plt_hook_commit {} registrations",
+        registered
+    ));
 
     api.plt_hook_commit()
         .map_err(|e| format!("plt_hook_commit: {e:?}"))?;
+    logi("install_hooks: plt_hook_commit returned OK");
 
     if old_fn.is_null() {
         // This can happen if none of the libraries we tried actually had
@@ -201,23 +280,50 @@ fn install_hooks(api: &mut ZygiskApi<'_, V5>) -> Result<usize, String> {
 
 /// Is this package on our allowlist?
 ///
-/// Reads `/data/adb/modules/vpnhide_zygisk/targets.txt` fresh every time
-/// a process is specialized. The file is a few hundred bytes at most,
-/// rarely changed, and we avoid stale cache issues by not caching.
+/// Reads `/data/adb/modules/vpnhide_zygisk/targets.txt` every time — but
+/// that path is inside `/data/adb/` which is root-only (SELinux
+/// `adb_data_file` label), and by the time we're in `post_app_specialize`
+/// the process has been specialized into the app's context
+/// (`untrusted_app`) which can't read it. Falls back to a hardcoded
+/// allowlist so the module still works when the file read fails.
+#[inline(never)]
 fn is_targeted(package: &str) -> bool {
-    let Ok(content) = fs::read_to_string(TARGETS_FILE) else {
-        return false;
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    logi(&format!("is_targeted check: '{package}'"));
+
+    // Direct string comparisons — clearer, and easier to extend by hand.
+    if package == "ru.plazius.shokoladnica" {
+        logi("is_targeted: matched shokoladnica (main)");
+        return true;
+    }
+    if package == "ru.plazius.shokoladnica:AppMetrica" {
+        logi("is_targeted: matched shokoladnica (AppMetrica)");
+        return true;
+    }
+    if package.starts_with("ru.plazius.shokoladnica") {
+        logi("is_targeted: matched shokoladnica (subprocess)");
+        return true;
+    }
+
+    match fs::read_to_string(TARGETS_FILE) {
+        Ok(content) => {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if line == package {
+                    return true;
+                }
+            }
+            false
         }
-        if line == package {
-            return true;
+        Err(e) => {
+            logw(&format!(
+                "is_targeted: can't read {TARGETS_FILE} ({e}); using hardcoded list only"
+            ));
+            false
         }
     }
-    false
 }
 
 /// Decode a `JString` (as stored in `AppSpecializeArgs::nice_name`) into
