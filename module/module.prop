@@ -1,0 +1,6 @@
+id=vpnhide_zygisk
+name=VPN Hide (Zygisk native)
+version=v0.1.0
+versionCode=1
+author=okhsunrog
+description=Hides active VPN interfaces from apps listed in /data/adb/modules/vpnhide_zygisk/targets.txt by hooking libc ioctl at the PLT level. Covers the native detection path (Flutter, JNI, raw C/C++) that Java-level LSPosed modules can't reach.

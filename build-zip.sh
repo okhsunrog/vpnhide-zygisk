@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Build the native library for aarch64 Android and package it into an
+# installable KernelSU/Magisk module zip.
+#
+# Requirements:
+#   - rustup target aarch64-linux-android (already installed)
+#   - cargo-ndk
+#   - Android NDK at $ANDROID_NDK_HOME or auto-detected from $HOME/Android/Sdk/ndk/*
+#   - zip
+
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR"
+
+# Auto-detect NDK if ANDROID_NDK_HOME isn't set
+if [ -z "${ANDROID_NDK_HOME:-}" ]; then
+    ANDROID_NDK_HOME="$(find "$HOME/Android/Sdk/ndk" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -V | tail -1)"
+fi
+if [ -z "${ANDROID_NDK_HOME:-}" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
+    echo "error: ANDROID_NDK_HOME not set and no NDK found under ~/Android/Sdk/ndk" >&2
+    exit 1
+fi
+echo "Using NDK: $ANDROID_NDK_HOME"
+export ANDROID_NDK_HOME
+
+# Build the cdylib for arm64-v8a
+cargo ndk -t arm64-v8a build --release
+
+SO_SRC="target/aarch64-linux-android/release/libvpnhide_zygisk.so"
+if [ ! -f "$SO_SRC" ]; then
+    echo "error: expected $SO_SRC after cargo ndk build, not found" >&2
+    exit 1
+fi
+
+# Assemble the module staging directory
+STAGING="target/module-staging"
+rm -rf "$STAGING"
+cp -a module "$STAGING"
+mkdir -p "$STAGING/zygisk"
+cp "$SO_SRC" "$STAGING/zygisk/arm64-v8a.so"
+
+# Zip it
+OUT_ZIP="target/vpnhide-zygisk.zip"
+rm -f "$OUT_ZIP"
+(cd "$STAGING" && zip -qr "../../$OUT_ZIP" .)
+
+echo
+echo "Built: $OUT_ZIP"
+ls -lh "$OUT_ZIP"

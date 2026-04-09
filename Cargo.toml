@@ -1,0 +1,32 @@
+[package]
+name = "vpnhide_zygisk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "0BSD"
+description = "Zygisk module (native libc hooks) that hides an active VPN from selected Android apps."
+repository = "https://github.com/okhsunrog/vpnhide-zygisk"
+
+[lib]
+# Zygisk loads the module as an Android shared library. Name must match
+# what customize.sh places at /data/adb/modules/<id>/zygisk/arm64-v8a.so
+name = "vpnhide_zygisk"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Zygisk API bindings (targeting v5 to match NeoZygisk)
+zygisk-api = { git = "https://github.com/rmnscnce/zygisk-api-rs.git" }
+libc = "0.2"
+jni = { version = "0.21", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+# Zygisk modules are very small — keep them tiny.
+
+[profile.dev]
+opt-level = 1
+panic = "abort"
