@@ -1,7 +1,67 @@
 # vpnhide-zygisk
 
 A tiny Zygisk module in Rust that hides an active VPN interface from
-selected Android apps by hooking libc `ioctl` at the PLT level.
+selected Android apps by hooking libc `ioctl`.
+
+## Status (2026-04-10)
+
+**WIP, not yet functional.** The module scaffolding works end-to-end —
+scope filter, pre/post-specialize flow, PLT hook registration, and
+commit are all wired up and don't crash. The actual interception
+does not work because PLT hooking at `post_app_specialize` cannot
+reach libraries that load later (libflutter.so is not yet mapped).
+See `src/lib.rs` `install_hooks()` and the session notes in
+`~/Documents/vpn-hiding.md` for the full analysis.
+
+**Next step**: swap the Zygisk PLT hook for an inline hook of
+`libc::ioctl` via ByteDance shadowhook. That catches every caller
+regardless of when their library loads.
+
+### Why inline instead of PLT
+
+- PLT hooks patch the CALLER's procedure linkage table entry for a
+  given symbol. To intercept `libflutter.so`'s call to `ioctl`, we'd
+  have to patch libflutter.so's PLT.
+- At `post_app_specialize` (the last Zygisk callback before the app's
+  Java code runs), libflutter.so is NOT yet mapped into the process.
+  Only ~350 Android system libraries are loaded.
+- None of those system libraries directly call `ioctl` from their own
+  code (verified via `readelf -r` — zero ioctl relocations across
+  libandroid, libbinder, libutils, libmedia, libui, libgui,
+  libnetd_client, libbase, libcutils, libc++, libandroid_runtime,
+  libart). They link against libc's ioctl but the call sites are
+  inside libc itself.
+- Inline hooking patches libc.so's `ioctl` entry point directly. Any
+  caller — libflutter, libapp, whatever — goes through our filter.
+  Load order becomes irrelevant.
+
+### Implementing the inline hook
+
+1. Build ByteDance shadowhook as a static library (CMake, `.a` file)
+   for aarch64-linux-android. Repo:
+   https://github.com/bytedance/android-inline-hook
+2. Write Rust FFI bindings for the three functions we need:
+   ```c
+   int  shadowhook_init(shadowhook_mode_t default_mode, bool debuggable);
+   void *shadowhook_hook_sym_name(const char *lib_name,
+                                  const char *sym_name,
+                                  void *new_addr,
+                                  void **orig_addr);
+   int  shadowhook_unhook(void *stub);
+   ```
+3. In `install_hooks()`, replace the Zygisk `plt_hook_register` loop
+   with a single `shadowhook_hook_sym_name("libc.so", "ioctl",
+   hooked_ioctl as _, &mut REAL_IOCTL)`.
+4. The existing `hooked_ioctl` function in `src/hooks.rs` stays
+   as-is — it's already the right shape for a libc `ioctl`
+   replacement.
+5. Add the shadowhook `.a` to build.rs via `cargo::rustc-link-lib=static=shadowhook`
+   and a corresponding `cc` crate build, OR compile the .a separately
+   and provide its path via environment variable.
+
+Estimated effort: half a day of work.
+
+## How it's supposed to work (design)
 
 Companion to the [Kotlin LSPosed module `vpnhide`](https://github.com/okhsunrog/vpnhide),
 which covers Java-level VPN detection. This module handles the **native**
