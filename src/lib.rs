@@ -15,9 +15,9 @@
 //! 3. **`postAppSpecialize`** — the app's main native libraries have now
 //!    been loaded into the process. Parse `/proc/self/maps`, collect every
 //!    distinct ELF file backing an executable mapping, and register a PLT
-//!    hook on each that redirects `ioctl` to our replacement function.
-//!    Commit the hooks. From this point on, any call from any loaded
-//!    library into libc's `ioctl` goes through our filter.
+//!    hook on each that redirects `ioctl`, `getifaddrs`, and `openat`
+//!    to our replacement functions. From this point on, any call from
+//!    any loaded library into these libc symbols goes through our filter.
 //!
 //! ## Module metadata
 //!
@@ -40,7 +40,8 @@ use zygisk_api::api::v5::{AppSpecializeArgs, V5, ZygiskOption};
 use zygisk_api::api::ZygiskApi;
 
 use crate::hooks::{
-    hooked_getifaddrs, hooked_ioctl, set_real_getifaddrs_ptr, set_real_ioctl_ptr,
+    hooked_getifaddrs, hooked_ioctl, hooked_openat, hooked_recvmsg, set_real_getifaddrs_ptr,
+    set_real_ioctl_ptr, set_real_openat_ptr, set_real_recvmsg_ptr,
 };
 
 const LOG_TAG: &str = "vpnhide-zygisk";
@@ -122,7 +123,7 @@ impl ZygiskModule for VpnHide {
         }
         match install_hooks() {
             Ok(()) => {
-                info!("hooks installed (inline libc!ioctl + getifaddrs)");
+                info!("hooks installed (inline libc!ioctl + getifaddrs + openat for proc/net/*)");
                 // Erase shadowhook's fingerprints from /proc/self/maps
                 // before any anti-tamper SDK (e.g. MIR HCE) gets a
                 // chance to scan them via raw syscalls.
@@ -143,7 +144,7 @@ fn mark_cleanup(api: &mut ZygiskApi<'_, V5>) {
 }
 
 /// Install inline hooks on `libc.so` via ByteDance shadowhook. We patch
-/// two entry points:
+/// three entry points:
 ///
 ///   * `ioctl`       — catches `SIOCGIFNAME` / `SIOCGIFFLAGS` interface
 ///                     probes from native code.
@@ -152,6 +153,11 @@ fn mark_cleanup(api: &mut ZygiskApi<'_, V5>) {
 ///                     inside libcore, by the Dart VM's
 ///                     `NetworkInterface.list()`, and by anything in C/C++
 ///                     that calls `getifaddrs()` directly.
+///   * `openat`      — intercepts opens of `/proc/net/{route,ipv6_route,
+///                     if_inet6,tcp,tcp6}`; returns a `memfd` with VPN
+///                     entries stripped out.
+///   * `recvmsg`     — filters netlink `RTM_NEWADDR` / `RTM_NEWLINK`
+///                     dump responses, removing VPN interface entries.
 ///
 /// This replaces the earlier PLT-hook approach. PLT hooks can only patch
 /// callers that are already mapped at `post_app_specialize` time — which
@@ -163,6 +169,8 @@ fn install_hooks() -> Result<(), String> {
 
     hook_libc_sym(c"ioctl", hooked_ioctl as *mut _, set_real_ioctl_ptr)?;
     hook_libc_sym(c"getifaddrs", hooked_getifaddrs as *mut _, set_real_getifaddrs_ptr)?;
+    hook_libc_sym(c"openat", hooked_openat as *mut _, set_real_openat_ptr)?;
+    hook_libc_sym(c"recvmsg", hooked_recvmsg as *mut _, set_real_recvmsg_ptr)?;
 
     Ok(())
 }
