@@ -21,6 +21,46 @@ against `ru.plazius.shokoladnica` (the Flutter-based cafe loyalty app that
 motivated this module): the VPN-detection banner no longer appears when a
 WireGuard tunnel is active.
 
+### Verified against third-party detection apps
+
+With this module **together with** the Kotlin LSPosed companion
+[okhsunrog/vpnhide](https://github.com/okhsunrog/vpnhide) installed, and
+WireGuard running in **split-tunnel** mode (so the detection apps' own
+HTTPS probes go through the carrier, not the tunnel), the following
+popular Russian "is there a VPN on this device?" apps report **all
+clean**, with no direct or indirect signals triggered:
+
+- [xtclovver/RKNHardering](https://github.com/xtclovver/RKNHardering) —
+  the Kotlin app that implements the Russian Ministry of Digital
+  Development's VPN-detection methodology. All GeoIP, IP comparison,
+  Direct signs (`TRANSPORT_VPN`, HTTP/SOCKS proxy), Indirect signs
+  (`NET_CAPABILITY_NOT_VPN`, interface enumeration, MTU, default route,
+  DNS servers, `dumpsys`), Location signals and Split-tunnel bypass
+  cards come back Clean.
+- [loop-uh/yourvpndead](https://github.com/loop-uh/yourvpndead) — the
+  "no root, no permissions, standard Android API, under one second"
+  detector. Reports `VPN: Не активен`, the only visible interfaces are
+  `dummy0`/`lo`/`rmnet16`, no VPN signals in direct or indirect checks.
+
+Neither module alone covers all of this:
+
+- The LSPosed companion handles the Java / Android framework side:
+  `NetworkCapabilities.hasTransport/hasCapability/getTransportInfo`,
+  `NetworkInterface.getNetworkInterfaces`,
+  `LinkProperties.getRoutes/getDnsServers`, `System.getProperty` for
+  proxy keys, and redirects `/proc/net/route|tcp|tcp6|…` reads done
+  through `java.io.FileInputStream` / `FileReader` to `/dev/null`.
+- **This** module closes the native side: `libc::ioctl` (`SIOCGIFNAME`
+  / `SIOCGIFFLAGS`) and `libc::getifaddrs`, which is what Flutter /
+  Dart apps and any JNI code would hit bypassing ART entirely.
+
+Split-tunnel is a requirement for the cards that compare the
+device-reported public IP against external checkers: the detection
+app's HTTPS requests must exit through the carrier, otherwise the
+checkers see the VPN exit IP and flag a mismatch with GeoIP / ASN
+databases. That's a network-layer fact, not something any client-side
+hook can fix.
+
 Current coverage (all hooks are inline on `libc.so`):
 - `ioctl(SIOCGIFFLAGS)` — pre-screened; returns `-1 ENODEV` if the caller
   hands us an `ifr_name` matching a VPN prefix.
