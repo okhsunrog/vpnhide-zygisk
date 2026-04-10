@@ -30,3 +30,6 @@ panic = "abort"
 [profile.dev]
 opt-level = 1
 panic = "abort"
+
+[build-dependencies]
+cmake = "0.1.58"

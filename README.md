@@ -1,138 +1,117 @@
 # vpnhide-zygisk
 
-A tiny Zygisk module in Rust that hides an active VPN interface from
-selected Android apps by hooking libc `ioctl`.
-
-## Status (2026-04-10)
-
-**WIP, not yet functional.** The module scaffolding works end-to-end —
-scope filter, pre/post-specialize flow, PLT hook registration, and
-commit are all wired up and don't crash. The actual interception
-does not work because PLT hooking at `post_app_specialize` cannot
-reach libraries that load later (libflutter.so is not yet mapped).
-See `src/lib.rs` `install_hooks()` and the session notes in
-`~/Documents/vpn-hiding.md` for the full analysis.
-
-**Next step**: swap the Zygisk PLT hook for an inline hook of
-`libc::ioctl` via ByteDance shadowhook. That catches every caller
-regardless of when their library loads.
-
-### Why inline instead of PLT
-
-- PLT hooks patch the CALLER's procedure linkage table entry for a
-  given symbol. To intercept `libflutter.so`'s call to `ioctl`, we'd
-  have to patch libflutter.so's PLT.
-- At `post_app_specialize` (the last Zygisk callback before the app's
-  Java code runs), libflutter.so is NOT yet mapped into the process.
-  Only ~350 Android system libraries are loaded.
-- None of those system libraries directly call `ioctl` from their own
-  code (verified via `readelf -r` — zero ioctl relocations across
-  libandroid, libbinder, libutils, libmedia, libui, libgui,
-  libnetd_client, libbase, libcutils, libc++, libandroid_runtime,
-  libart). They link against libc's ioctl but the call sites are
-  inside libc itself.
-- Inline hooking patches libc.so's `ioctl` entry point directly. Any
-  caller — libflutter, libapp, whatever — goes through our filter.
-  Load order becomes irrelevant.
-
-### Implementing the inline hook
-
-1. Build ByteDance shadowhook as a static library (CMake, `.a` file)
-   for aarch64-linux-android. Repo:
-   https://github.com/bytedance/android-inline-hook
-2. Write Rust FFI bindings for the three functions we need:
-   ```c
-   int  shadowhook_init(shadowhook_mode_t default_mode, bool debuggable);
-   void *shadowhook_hook_sym_name(const char *lib_name,
-                                  const char *sym_name,
-                                  void *new_addr,
-                                  void **orig_addr);
-   int  shadowhook_unhook(void *stub);
-   ```
-3. In `install_hooks()`, replace the Zygisk `plt_hook_register` loop
-   with a single `shadowhook_hook_sym_name("libc.so", "ioctl",
-   hooked_ioctl as _, &mut REAL_IOCTL)`.
-4. The existing `hooked_ioctl` function in `src/hooks.rs` stays
-   as-is — it's already the right shape for a libc `ioctl`
-   replacement.
-5. Add the shadowhook `.a` to build.rs via `cargo::rustc-link-lib=static=shadowhook`
-   and a corresponding `cc` crate build, OR compile the .a separately
-   and provide its path via environment variable.
-
-Estimated effort: half a day of work.
-
-## How it's supposed to work (design)
+A small Zygisk module written in Rust that hides an active VPN interface
+from selected Android apps by inline-hooking libc's `ioctl`.
 
 Companion to the [Kotlin LSPosed module `vpnhide`](https://github.com/okhsunrog/vpnhide),
-which covers Java-level VPN detection. This module handles the **native**
-detection path — apps calling `ioctl(SIOCGIFNAME)`/`ioctl(SIOCGIFFLAGS)`,
-`getifaddrs()`, or raw netlink sockets directly from C/C++/JNI/Flutter
-runtime code that never enters ART.
-
-Scope: apps where you want the VPN hidden are listed one-per-line in
-`/data/adb/modules/vpnhide_zygisk/targets.txt`. Every other app sees an
-unchanged world.
+which handles Java-level VPN detection. This module covers the **native**
+detection path — apps calling `ioctl(SIOCGIFNAME)` / `ioctl(SIOCGIFFLAGS)`
+from C/C++/JNI/Flutter runtime code that never enters ART.
 
 ## Status
 
-v0.1.0 — **ioctl hook only**. Covers `SIOCGIFNAME` and `SIOCGIFFLAGS`,
-which is the detection path observed in Шоколадница (the cafe loyalty
-app that motivated this module). Planned additions:
+Working on Android 16 (API 36) with KernelSU-Next + NeoZygisk. Verified
+against `ru.plazius.shokoladnica` (the Flutter-based cafe loyalty app that
+motivated this module): the VPN-detection banner no longer appears when a
+WireGuard tunnel is active.
 
-- `getifaddrs` / `freeifaddrs` wrappers for apps using the higher-level
-  libc helper (Dart VM's `NetworkInterface.list()` uses this)
-- `ioctl(SIOCGIFCONF)` bulk query filter
-- `recvmsg` filter on `NETLINK_ROUTE` sockets for apps that speak netlink
-  directly without going through `getifaddrs`
+Current coverage:
+- `ioctl(SIOCGIFFLAGS)` — pre-screened; returns `-1 ENODEV` if the caller
+  hands us an `ifr_name` matching a VPN prefix.
+- `ioctl(SIOCGIFNAME)` — called through; if the returned name is a VPN,
+  rewritten to `-1 ENODEV`.
+- Any other `ioctl` request: passthrough.
 
-## How it works
+Planned:
+- `getifaddrs` / `freeifaddrs` filter (Dart VM's `NetworkInterface.list()`).
+- `ioctl(SIOCGIFCONF)` bulk-query filter.
+- `recvmsg` filter on `NETLINK_ROUTE` sockets.
 
-The module runs inside each forked app process via NeoZygisk. At
-`preAppSpecialize` it reads the package name (`args.nice_name`), checks
-`targets.txt`, and either bails out (with `DlCloseModuleLibrary` to
-unload itself from memory) or flags itself as active. At
-`postAppSpecialize` — once the app's native libraries have been loaded
-— it parses `/proc/self/maps`, collects every unique ELF backing an
-executable mapping, and calls `pltHookRegister` once per library to
-redirect `ioctl` to its replacement function. Finally `pltHookCommit`
-applies the patches.
+## Architecture
 
-The replacement filter:
+The module runs inside each forked app process via NeoZygisk.
 
-- **`SIOCGIFFLAGS`** (app already has a name, wants flags): if the input
-  `ifr_name` matches a VPN prefix, set `errno=ENODEV` and return `-1`
-  without touching the real ioctl. The kernel never tells the app that
-  `tun0` has `IFF_POINTOPOINT` and `IFF_RUNNING`.
-- **`SIOCGIFNAME`** (app has an index, wants the name): call the real
-  ioctl, check the returned name. If it's a VPN, rewrite to errno=ENODEV
-  return -1. The app sees an empty slot at that index and moves on.
-- Any other `ioctl` request passes through unchanged.
+1. **`pre_app_specialize`** — runs on the zygote side before uid drop and
+   SELinux context transition. We read the package name from
+   `args.nice_name`, check it against `/data/adb/modules/vpnhide_zygisk/targets.txt`
+   plus a small built-in allowlist, and either:
+   - set an internal `is_target` flag, or
+   - call `DlCloseModuleLibrary` so Zygisk unloads our `.so` from the
+     process on callback return (non-targeted apps pay zero cost).
+2. **`post_app_specialize`** — on targeted processes only: initialize
+   ByteDance shadowhook and install a single inline hook on
+   `libc.so!ioctl`. From this point on, every caller in the process —
+   regardless of when its library was dlopen'd — ends up in our
+   `hooked_ioctl` replacement.
 
-VPN interface prefixes: `tun`, `ppp`, `tap`, `wg`, `ipsec`, `xfrm`,
-`utun`, `l2tp`, `gre`, plus anything containing the substring `vpn`.
-Matches the list in the Kotlin companion module.
+### Why inline hooking instead of PLT
+
+PLT hooks patch the caller library's procedure linkage table entry for a
+given symbol. To intercept `libflutter.so`'s call to `ioctl` that way we'd
+have to patch libflutter.so's PLT.
+
+At `post_app_specialize` — the last Zygisk callback before the app's Java
+code runs — libflutter.so / libapp.so / the Dart VM's native code are
+**not yet loaded**. Only the ~350 Android system libraries are mapped, and
+none of them directly call `ioctl` from their own code (verified via
+`readelf -r` on libandroid, libbinder, libutils, libmedia, libui, libgui,
+libnetd_client, libbase, libcutils, libc++, libandroid_runtime, libart —
+zero ioctl relocations across all of them). The ioctl call sites are
+inside libc itself.
+
+Inline-hooking libc.so's `ioctl` entry point rewrites the first few
+instructions of the function in-place. Any caller in the process — Flutter,
+any JNI library, anything dlopen'd later — eventually jumps to that same
+address and lands on our trampoline. Load order becomes irrelevant. The
+only thing inline libc hooks don't catch is apps issuing `syscall(SYS_ioctl, …)`
+directly, which is extremely rare outside of deliberate anti-hook code.
+
+### shadowhook fork
+
+Inline hooking is provided by [ByteDance shadowhook](https://github.com/bytedance/android-inline-hook).
+We carry a small fork at [okhsunrog/android-inline-hook](https://github.com/okhsunrog/android-inline-hook)
+(branch `vpnhide-zygisk`), vendored as a git submodule under
+`third_party/android-inline-hook/`, with two changes on top of upstream:
+
+1. **`SHADOWHOOK_STATIC=ON` CMake option** — builds `libshadowhook.a`
+   instead of a shared library so we can embed it directly into this
+   Rust cdylib, and drops the SHARED-only link options.
+2. **`sh_linker_init()` stub** — upstream hooks the Android dynamic linker's
+   `soinfo::call_constructors` / `soinfo::call_destructors` so it can apply
+   "pending" hooks to libraries dlopen'd after init. On Android 16 (API 36)
+   the hardcoded symbol table in `sh_linker_hook_call_ctors_dtors()` no
+   longer matches the newer linker layout, and the call fails with
+   `SHADOWHOOK_ERRNO_INIT_LINKER`, blocking all subsequent hooks. We don't
+   use the pending-hook feature (our target libc.so is always preloaded),
+   so the stub skips this path entirely.
 
 ## Build
 
 Requirements:
 
-- Rust nightly or stable ≥ 1.85 (edition 2024)
+- Rust ≥ 1.85 (edition 2024)
 - `rustup target add aarch64-linux-android`
 - `cargo install cargo-ndk`
-- Android NDK installed somewhere under `~/Android/Sdk/ndk/` (auto-detected
-  by `build-zip.sh`)
+- Android NDK (auto-detected under `~/Android/Sdk/ndk/`; any recent NDK
+  that ships `libclang_rt.builtins-aarch64-android.a` works)
+- CMake ≥ 3.22, Ninja
+- `git submodule update --init --recursive`
 
 Build & package:
 
 ```bash
 ./build-zip.sh
-# Output: target/vpnhide-zygisk.zip (~160 KB)
+# Output: target/vpnhide-zygisk.zip (~180 KB)
 ```
+
+`build.rs` invokes the NDK's CMake toolchain on the shadowhook submodule,
+pulls in `libclang_rt.builtins-aarch64-android.a` for `__clear_cache`,
+and statically links everything into `libvpnhide_zygisk.so`.
 
 ## Install
 
 1. `adb push target/vpnhide-zygisk.zip /sdcard/Download/`
-2. Open KernelSU-Next manager → Modules → Install from storage → pick the zip
+2. KernelSU-Next manager → Modules → Install from storage → pick the zip
 3. Reboot
 4. Edit `/data/adb/modules/vpnhide_zygisk/targets.txt` to add your target
    apps (one package name per line, `#` for comments):
@@ -143,46 +122,46 @@ Build & package:
    ```
 
 5. Force-stop the target app(s) so they re-fork with the hooks active:
-   `adb shell "am force-stop <pkg>"`
+   `adb shell am force-stop <pkg>`
 6. Verify via `adb logcat | grep vpnhide-zygisk`. Expected lines:
+
    ```
+   I vpnhide-zygisk: is_targeted: matched shokoladnica (main)
    I vpnhide-zygisk: pre_app_specialize: targeting ru.plazius.shokoladnica
-   I vpnhide-zygisk: hooks installed across 87 libraries
+   E shadowhook_tag: shadowhook init(default_mode: UNIQUE, …), return: 0
+   I vpnhide-zygisk: hooks installed (inline libc!ioctl)
    ```
 
-## Testing
+## Filter logic
 
-The only reliable way to test is with the original detection being
-triggered. For the Шоколадница case: open the app, see that the
-"VPN detected" warning no longer appears. For a generic test, install
-the `strace` binary from `~/code/android-tools/strace-arm64-android/`
-and verify that `SIOCGIFNAME`/`SIOCGIFFLAGS` ioctls targeting VPN
-interfaces return `-1 ENODEV` in the traced output.
+VPN interface prefixes: `tun`, `ppp`, `tap`, `wg`, `ipsec`, `xfrm`, `utun`,
+`l2tp`, `gre`, plus anything containing the substring `vpn`. Matches the
+list in the Kotlin companion module.
+
+- **`SIOCGIFFLAGS`** (app already has a name, wants flags): if the input
+  `ifr_name` matches a VPN prefix, set `errno=ENODEV` and return `-1`
+  without touching the real ioctl. The kernel never tells the app that
+  `tun0` has `IFF_POINTOPOINT` / `IFF_RUNNING`.
+- **`SIOCGIFNAME`** (app has an index, wants the name): call the real
+  ioctl, check the returned name. If it's a VPN, rewrite to `-1 ENODEV`.
+  The app sees an empty slot at that index and moves on.
+- Any other request passes through unchanged.
 
 ## Uninstall
 
-1. KernelSU-Next manager → Modules → VPN Hide (Zygisk native) → Remove
-2. Reboot
+KernelSU-Next manager → Modules → VPN Hide (Zygisk native) → Remove.
+Reboot.
 
 ## Files
 
 - `src/lib.rs` — module entry point, scope file handling, hook installer
-- `src/hooks.rs` — the `hooked_ioctl` replacement function + errno helper
-- `src/filter.rs` — VPN interface name matching logic (unit tested)
-- `src/maps.rs` — `/proc/self/maps` parser (unit tested)
-- `module/` — KernelSU/Magisk module metadata files
+- `src/hooks.rs` — `hooked_ioctl` replacement + errno helper
+- `src/filter.rs` — VPN interface name matching (unit tested)
+- `src/shadowhook.rs` — minimal FFI to shadowhook
+- `build.rs` — drives CMake on the shadowhook submodule
+- `third_party/android-inline-hook/` — submodule (our shadowhook fork)
+- `module/` — KernelSU/Magisk module metadata
 - `build-zip.sh` — cross-compile + package script
-
-## Architecture notes
-
-Zygisk's `pltHookRegister(dev, inode, symbol, new, &old)` patches the PLT
-table of **the caller library identified by (dev, inode)**. To intercept
-`ioctl` from every possible caller in a process, we have to register a
-hook once per unique library that's mapped into the process. That's why
-`install_hooks` iterates `/proc/self/maps` and calls `pltHookRegister`
-for every distinct ELF. This catches all libraries loaded at
-`postAppSpecialize` time; libraries loaded later via `dlopen` would need
-a second pass (future work).
 
 ## License
 
