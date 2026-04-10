@@ -16,10 +16,14 @@ for full coverage of the Java and native stacks.
 
 ## Status
 
-Working on Android 16 (API 36) with KernelSU-Next + NeoZygisk. Verified
-against `ru.plazius.shokoladnica` (the Flutter-based cafe loyalty app that
-motivated this module): the VPN-detection banner no longer appears when a
-WireGuard tunnel is active.
+Tested baseline: Android 16 (API 36) on a Pixel 8 Pro with KernelSU-Next
++ NeoZygisk. Verified against `ru.plazius.shokoladnica` (the
+Flutter-based cafe loyalty app that motivated this module): the
+VPN-detection banner no longer appears when a WireGuard tunnel is
+active.
+
+Should work on **any current Zygisk implementation** — see the
+[Compatibility](#compatibility) section below.
 
 ### Verified against third-party detection apps
 
@@ -133,9 +137,39 @@ Planned:
 - Optional: `connect()` filter on localhost proxy ports, to defeat
   YourVPNDead-style SOCKS5 port probing.
 
+## Compatibility
+
+The module declares itself as Zygisk API v5 (via the `zygisk-api`
+crate's `V5` shape) but only actually calls v1-era functions
+(`pre_app_specialize`, `post_app_specialize`, `args.nice_name`,
+`set_option(DlCloseModuleLibrary)`). The inline libc hooks happen
+inside the process via shadowhook and don't go through the Zygisk API
+at all. The Zygisk side only needs to inject our `.so` into zygote
+and dispatch the two specialize callbacks.
+
+That means we run on every modern Zygisk implementation:
+
+| Setup | Works |
+|---|---|
+| Stock Magisk (API v5 since topjohnwu's recent versions) + LSPosed | ✅ |
+| Magisk + ZygiskNext + LSPosed | ✅ |
+| Magisk + NeoZygisk + LSPosed | ✅ |
+| KernelSU + ZygiskNext + LSPosed | ✅ |
+| KernelSU-Next + NeoZygisk + LSPosed/Vector | ✅ (tested baseline) |
+| APatch + any Zygisk implementation + LSPosed | ✅ (untested in CI) |
+
+Hard requirements:
+
+- arm64 / `aarch64-linux-android` only — `build.rs` hard-fails on
+  other targets.
+- A Zygisk implementation that exposes API ≥ v1 (every shipping
+  Zygisk fork does — Magisk's own `ZYGISK_API_VERSION` has been at 5
+  since well before this module existed).
+- LSPosed/Vector for the [Java-side companion `vpnhide`](https://github.com/okhsunrog/vpnhide).
+
 ## Architecture
 
-The module runs inside each forked app process via NeoZygisk.
+The module runs inside each forked app process via Zygisk.
 
 1. **`pre_app_specialize`** — runs on the zygote side before uid drop and
    SELinux context transition. We read the package name from
@@ -293,9 +327,6 @@ list in the Kotlin companion module.
   `NetworkInterface.getNetworkInterfaces()`, and similar ART-side APIs
   are handled by the [Kotlin LSPosed companion module `vpnhide`](https://github.com/okhsunrog/vpnhide).
   You almost always want both modules installed together.
-- **NeoZygisk / Zygisk API v5 only.** The `zygisk-api` crate is pinned to
-  the V5 shape. Legacy Magisk-Zygisk (v1–v4) is not supported; use
-  NeoZygisk or a KernelSU-Next build that ships it.
 - **arm64 only.** `aarch64-linux-android` is the only supported target.
   `build.rs` hard-fails on other architectures; no 32-bit arm, no x86.
 - **Tested only on Android 16 (API 36).** Should work back to the
