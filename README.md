@@ -3,10 +3,16 @@
 A small Zygisk module written in Rust that hides an active VPN interface
 from selected Android apps by inline-hooking libc's `ioctl`.
 
-Companion to the [Kotlin LSPosed module `vpnhide`](https://github.com/okhsunrog/vpnhide),
-which handles Java-level VPN detection. This module covers the **native**
-detection path — apps calling `ioctl(SIOCGIFNAME)` / `ioctl(SIOCGIFFLAGS)`
-from C/C++/JNI/Flutter runtime code that never enters ART.
+Companion to the Kotlin LSPosed / Vector module
+[**okhsunrog/vpnhide**](https://github.com/okhsunrog/vpnhide), which
+handles Java-level VPN detection (`ConnectivityManager`,
+`NetworkInterface`, `LinkProperties`, `System.getProperty` for proxy
+keys, `NetworkCapabilities.getTransportInfo`, …). This module covers
+the **native** detection path instead — apps calling `ioctl(SIOCGIFNAME)`
+/ `ioctl(SIOCGIFFLAGS)` / `getifaddrs()` from C/C++/JNI/Flutter
+runtime code that never enters ART. The two modules are independent
+and share no runtime state; install either one alone, or both together
+for full coverage of the Java and native stacks.
 
 ## Status
 
