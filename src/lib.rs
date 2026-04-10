@@ -44,7 +44,11 @@ use crate::hooks::{
 };
 
 const LOG_TAG: &str = "vpnhide-zygisk";
-const TARGETS_FILE: &str = "/data/adb/modules/vpnhide_zygisk/targets.txt";
+/// Path to the user's allowlist. Lives OUTSIDE the module directory so
+/// it survives module updates (KSU/Magisk wipe `/data/adb/modules/<id>/`
+/// on every install). `customize.sh` is responsible for creating the
+/// directory and migrating the legacy in-module file on first run.
+const TARGETS_FILE: &str = "/data/adb/vpnhide_zygisk/targets.txt";
 
 /// Initialize `android_logger` exactly once. Cheap to call from every
 /// forked process — subsequent calls are no-ops. The compile-time log

@@ -88,7 +88,7 @@ The module runs inside each forked app process via NeoZygisk.
 
 1. **`pre_app_specialize`** — runs on the zygote side before uid drop and
    SELinux context transition. We read the package name from
-   `args.nice_name`, check it against `/data/adb/modules/vpnhide_zygisk/targets.txt`
+   `args.nice_name`, check it against `/data/adb/vpnhide_zygisk/targets.txt`
    plus a small built-in allowlist, and either:
    - set an internal `is_target` flag, or
    - call `DlCloseModuleLibrary` so Zygisk unloads our `.so` from the
@@ -196,7 +196,7 @@ cargo ndk -t arm64-v8a build --release \
      manager and tap the WebUI entry. You get a searchable list of
      user-installed packages with checkboxes; Save writes the selection
      to `targets.txt`. See [`module/webroot/index.html`](module/webroot/index.html).
-   - **Shell:** edit `/data/adb/modules/vpnhide_zygisk/targets.txt`
+   - **Shell:** edit `/data/adb/vpnhide_zygisk/targets.txt`
      directly (one package name per line, `#` for comments). A line with
      a base package name `com.example.app` also matches its
      subprocesses like `com.example.app:background`.

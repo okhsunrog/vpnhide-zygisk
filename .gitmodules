@@ -1,4 +1,4 @@
 [submodule "third_party/android-inline-hook"]
 	path = third_party/android-inline-hook
-	url = git@github.com:okhsunrog/android-inline-hook.git
+	url = https://github.com/okhsunrog/android-inline-hook.git
 	branch = vpnhide-zygisk
