@@ -22,12 +22,25 @@
 //! * If anything fails inside a hook, we fall back to calling the
 //!   original. Panicking would abort the entire process.
 
+use core::cell::Cell;
 use core::ffi::{c_int, c_void};
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use libc::{SIOCGIFFLAGS, SIOCGIFNAME, ifreq};
 
 use crate::filter::is_vpn_iface_bytes;
+
+// Thread-local guard: set by hooked_getifaddrs before calling the real
+// getifaddrs, cleared after. While set, hooked_ioctl passes through
+// without filtering. This prevents our ioctl hook from interfering with
+// libc's INTERNAL ioctl(SIOCGIFFLAGS) calls made inside getifaddrs() —
+// those calls are redundant (getifaddrs hook filters the result anyway)
+// and harmful (returning ENODEV breaks libc's ifaddrs list construction,
+// causing errors like `ioctl(SIOCGIFFLAGS) for "tun0" failed in ifaddrs`
+// and corrupting NFC/HCE payment flows).
+thread_local! {
+    static IN_GETIFADDRS: Cell<bool> = const { Cell::new(false) };
+}
 
 // Android bionic exposes the thread-local errno via `int *__errno()`.
 // The `libc` crate doesn't re-export this symbol for android targets,
@@ -109,6 +122,12 @@ pub unsafe extern "C" fn hooked_ioctl(
         set_errno(libc::EFAULT);
         return -1;
     };
+
+    // If we're inside a hooked_getifaddrs call on this thread, pass
+    // through without filtering. See the IN_GETIFADDRS doc comment.
+    if IN_GETIFADDRS.with(|f| f.get()) {
+        return unsafe { real(fd, request, arg) };
+    }
 
     // SIOCGIFFLAGS — the app has a name and wants flags. Pre-screen input.
     if request == SIOCGIFFLAGS as libc::c_ulong {
@@ -203,7 +222,13 @@ pub unsafe extern "C" fn hooked_getifaddrs(ifap: *mut *mut libc::ifaddrs) -> c_i
         return -1;
     };
 
+    // Set the thread-local guard so hooked_ioctl passes through while
+    // libc's real getifaddrs runs (it internally calls ioctl for each
+    // interface to get flags — we must not filter those).
+    IN_GETIFADDRS.with(|f| f.set(true));
     let rc = unsafe { real(ifap) };
+    IN_GETIFADDRS.with(|f| f.set(false));
+
     if rc != 0 || ifap.is_null() {
         return rc;
     }
