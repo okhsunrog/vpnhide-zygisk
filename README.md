@@ -14,6 +14,12 @@ runtime code that never enters ART. The two modules are independent
 and share no runtime state; install either one alone, or both together
 for full coverage of the Java and native stacks.
 
+For banking apps with anti-tamper SDKs (MIR HCE) where userspace hooks
+cause crashes or NFC payment degradation, use
+[okhsunrog/vpnhide-kmod](https://github.com/okhsunrog/vpnhide-kmod)
+instead — a kernel module that provides the same native filtering
+without any footprint in the app's process.
+
 ## Status
 
 Tested baseline: Android 16 (API 36) on a Pixel 8 Pro with KernelSU-Next
@@ -327,6 +333,11 @@ list in the Kotlin companion module.
   `NetworkInterface.getNetworkInterfaces()`, and similar ART-side APIs
   are handled by the [Kotlin LSPosed companion module `vpnhide`](https://github.com/okhsunrog/vpnhide).
   You almost always want both modules installed together.
+- **Banking apps with MIR HCE SDK.** The SDK detects modified function
+  prologues in libc.so and silently disables NFC contactless payments.
+  For these apps, use
+  [vpnhide-kmod](https://github.com/okhsunrog/vpnhide-kmod)
+  (kernel-level filtering) instead.
 - **arm64 only.** `aarch64-linux-android` is the only supported target.
   `build.rs` hard-fails on other architectures; no 32-bit arm, no x86.
 - **Tested only on Android 16 (API 36).** Should work back to the
