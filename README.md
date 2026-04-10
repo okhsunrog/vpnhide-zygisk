@@ -108,19 +108,43 @@ Build & package:
 pulls in `libclang_rt.builtins-aarch64-android.a` for `__clear_cache`,
 and statically links everything into `libvpnhide_zygisk.so`.
 
+### Log level
+
+Logging goes through the [`log`](https://crates.io/crates/log) crate +
+`android_logger`. The compile-time ceiling is controlled by a Cargo
+feature on this crate; calls below the ceiling are statically elided
+(zero code size, zero runtime cost).
+
+| feature     | default | effect                          |
+| ----------- | ------- | ------------------------------- |
+| `log-off`   |         | no logs at all                  |
+| `log-error` |         | errors only                     |
+| `log-warn`  |         | errors, warnings                |
+| `log-info`  | ✓       | errors, warnings, info          |
+| `log-debug` |         | + debug (e.g. `on_load` traces) |
+| `log-trace` |         | + trace                         |
+
+Override the default:
+
+```bash
+cargo ndk -t arm64-v8a build --release \
+  --no-default-features --features log-debug
+```
+
 ## Install
 
 1. `adb push target/vpnhide-zygisk.zip /sdcard/Download/`
 2. KernelSU-Next manager → Modules → Install from storage → pick the zip
 3. Reboot
-4. Edit `/data/adb/modules/vpnhide_zygisk/targets.txt` to add your target
-   apps (one package name per line, `#` for comments):
-
-   ```
-   ru.plazius.shokoladnica
-   com.example.targetapp
-   ```
-
+4. Pick the target apps. Two ways:
+   - **WebUI (recommended):** open the module in the KernelSU-Next
+     manager and tap the WebUI entry. You get a searchable list of
+     user-installed packages with checkboxes; Save writes the selection
+     to `targets.txt`. See [`module/webroot/index.html`](module/webroot/index.html).
+   - **Shell:** edit `/data/adb/modules/vpnhide_zygisk/targets.txt`
+     directly (one package name per line, `#` for comments). A line with
+     a base package name `com.example.app` also matches its
+     subprocesses like `com.example.app:background`.
 5. Force-stop the target app(s) so they re-fork with the hooks active:
    `adb shell am force-stop <pkg>`
 6. Verify via `adb logcat | grep vpnhide-zygisk`. Expected lines:
@@ -172,15 +196,11 @@ list in the Kotlin companion module.
   `android-24` link target in principle, but nothing older has been
   exercised. The shadowhook linker-hook workaround in our fork was
   specifically motivated by API 36; older versions may or may not need it.
-- **Verbose logcat in release builds.** Pre/post-specialize and
-  `is_targeted` decisions are logged at `I` level in every build, so
-  `logcat | grep vpnhide-zygisk` is noisy. Fine for debugging, less so
-  for long-term deployment.
-- **Built-in allowlist hardcodes `ru.plazius.shokoladnica`.** The primary
-  use case that drove this module is baked into `is_targeted()` as a
-  fallback so the module works out-of-the-box for the author. If you fork
-  this for a different target app, edit `src/lib.rs` or rely purely on
-  `targets.txt`.
+- **Logging.** Log level is compile-time selectable via the `log-*`
+  Cargo features (see below). The default release build is `info`, which
+  emits a handful of lines per targeted process (`pre_app_specialize`,
+  shadowhook init result, hook installation) and is silent for
+  non-targeted processes once they're unloaded.
 
 ## Uninstall
 

@@ -18,6 +18,22 @@ crate-type = ["cdylib"]
 zygisk-api = { git = "https://github.com/rmnscnce/zygisk-api-rs.git" }
 libc = "0.2"
 jni = { version = "0.21", default-features = false }
+log = { version = "0.4.29", default-features = false }
+android_logger = { version = "0.15.1", default-features = false }
+
+# Compile-time log level. `log` statically elides any call below the
+# selected ceiling, so disabled levels add zero runtime cost and zero
+# code size. Exactly one `log-*` feature must be enabled; default is
+# `log-info`. Override with e.g.:
+#   cargo ndk -t arm64-v8a build --release --no-default-features --features log-debug
+[features]
+default = ["log-info"]
+log-off   = ["log/release_max_level_off"]
+log-error = ["log/release_max_level_error"]
+log-warn  = ["log/release_max_level_warn"]
+log-info  = ["log/release_max_level_info"]
+log-debug = ["log/release_max_level_debug"]
+log-trace = ["log/release_max_level_trace"]
 
 [profile.release]
 opt-level = 3

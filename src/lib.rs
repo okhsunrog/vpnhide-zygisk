@@ -31,55 +31,33 @@ mod hooks;
 mod shadowhook;
 
 use std::fs;
+use std::sync::Once;
 
 use jni::JNIEnv;
+use log::{debug, error, info};
 use zygisk_api::ZygiskModule;
 use zygisk_api::api::v5::{AppSpecializeArgs, V5, ZygiskOption};
 use zygisk_api::api::ZygiskApi;
 
 use crate::hooks::{hooked_ioctl, set_real_ioctl_ptr};
 
-const LOG_TAG: &core::ffi::CStr = c"vpnhide-zygisk";
+const LOG_TAG: &str = "vpnhide-zygisk";
 const TARGETS_FILE: &str = "/data/adb/modules/vpnhide_zygisk/targets.txt";
 
-/// Log at INFO level via Android's liblog. Small shim that avoids pulling
-/// in `log`/`android_logger`, keeping the .so tiny.
-fn logi(msg: &str) {
-    let c = std::ffi::CString::new(msg).unwrap_or_default();
-    unsafe {
-        __android_log_print(LogPriority::INFO as i32, LOG_TAG.as_ptr(), c"%s".as_ptr(), c.as_ptr());
-    }
-}
-fn logw(msg: &str) {
-    let c = std::ffi::CString::new(msg).unwrap_or_default();
-    unsafe {
-        __android_log_print(LogPriority::WARN as i32, LOG_TAG.as_ptr(), c"%s".as_ptr(), c.as_ptr());
-    }
-}
-fn loge(msg: &str) {
-    let c = std::ffi::CString::new(msg).unwrap_or_default();
-    unsafe {
-        __android_log_print(LogPriority::ERROR as i32, LOG_TAG.as_ptr(), c"%s".as_ptr(), c.as_ptr());
-    }
-}
-
-#[repr(i32)]
-#[allow(dead_code)]
-enum LogPriority {
-    VERBOSE = 2,
-    DEBUG = 3,
-    INFO = 4,
-    WARN = 5,
-    ERROR = 6,
-}
-
-unsafe extern "C" {
-    fn __android_log_print(
-        prio: core::ffi::c_int,
-        tag: *const core::ffi::c_char,
-        fmt: *const core::ffi::c_char,
-        ...
-    ) -> core::ffi::c_int;
+/// Initialize `android_logger` exactly once. Cheap to call from every
+/// forked process — subsequent calls are no-ops. The compile-time log
+/// filter is controlled by the `log` crate's `release_max_level_*`
+/// Cargo feature (see our `Cargo.toml`); anything below that level is
+/// monomorphized away to a no-op.
+fn init_logger() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_tag(LOG_TAG)
+                .with_max_level(log::LevelFilter::Trace),
+        );
+    });
 }
 
 /// The module struct. Held as a `Default` singleton by the
@@ -99,7 +77,8 @@ impl ZygiskModule for VpnHide {
     type Api = V5;
 
     fn on_load(&self, _api: ZygiskApi<'_, V5>, _env: JNIEnv<'_>) {
-        logi("on_load");
+        init_logger();
+        debug!("on_load");
     }
 
     fn pre_app_specialize<'a>(
@@ -115,7 +94,7 @@ impl ZygiskModule for VpnHide {
         let package = read_jstring(&env, args.nice_name);
         match package.as_deref() {
             Some(p) if is_targeted(p) => {
-                logi(&format!("pre_app_specialize: targeting {p}"));
+                info!("pre_app_specialize: targeting {p}");
                 self.is_target.set(true);
             }
             _ => {
@@ -136,8 +115,8 @@ impl ZygiskModule for VpnHide {
             return;
         }
         match install_hooks() {
-            Ok(()) => logi("hooks installed (inline libc!ioctl)"),
-            Err(err) => loge(&format!("install_hooks failed: {err}")),
+            Ok(()) => info!("hooks installed (inline libc!ioctl)"),
+            Err(err) => error!("install_hooks failed: {err}"),
         }
     }
 
@@ -186,42 +165,30 @@ fn install_hooks() -> Result<(), String> {
 ///
 /// Called from `pre_app_specialize`, which runs on the zygote side BEFORE
 /// the uid drop and SELinux context transition, so `/data/adb/modules/...`
-/// is still readable here. Also keeps a small hardcoded allowlist as a
-/// convenience so the module works out-of-the-box for the primary use case.
+/// is still readable here.
+///
+/// An entry matches if the target file contains either the exact package
+/// name (e.g. `com.example.app`) or the process base name that is the
+/// package of a multi-process app (e.g. `com.example.app:background` is
+/// matched by an entry for `com.example.app`). This means a single line
+/// per app in `targets.txt` covers all of its subprocesses.
 #[inline(never)]
 fn is_targeted(package: &str) -> bool {
-
-    // Direct string comparisons — clearer, and easier to extend by hand.
-    if package == "ru.plazius.shokoladnica" {
-        logi("is_targeted: matched shokoladnica (main)");
-        return true;
-    }
-    if package == "ru.plazius.shokoladnica:AppMetrica" {
-        logi("is_targeted: matched shokoladnica (AppMetrica)");
-        return true;
-    }
-    if package.starts_with("ru.plazius.shokoladnica") {
-        logi("is_targeted: matched shokoladnica (subprocess)");
-        return true;
-    }
+    let base_package = match package.split_once(':') {
+        Some((base, _)) => base,
+        None => package,
+    };
 
     match fs::read_to_string(TARGETS_FILE) {
-        Ok(content) => {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if line == package {
-                    return true;
-                }
+        Ok(content) => content.lines().any(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return false;
             }
-            false
-        }
+            line == package || line == base_package
+        }),
         Err(e) => {
-            logw(&format!(
-                "is_targeted: can't read {TARGETS_FILE} ({e}); using hardcoded list only"
-            ));
+            log::warn!("is_targeted: can't read {TARGETS_FILE} ({e}); no targets active");
             false
         }
     }
