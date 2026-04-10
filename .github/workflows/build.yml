@@ -7,10 +7,16 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository }}/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout (with submodules)
@@ -18,48 +24,23 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      # Pin the NDK version we develop against. Newer NDKs *should* work
-      # but the shadowhook fork has only been verified against r28.2 and
-      # r29 here. Bumping is a one-line change.
-      - name: Install Android NDK r28.2.13676358
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r28
-          add-to-path: false
-
-      - name: Install build tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build zip
+      - name: Mark workspace as a safe git directory
+        # actions/checkout runs as a different uid than the image's
+        # default user, so git refuses to operate on the worktree
+        # without this. Cheap to apply unconditionally.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
-
       - name: Build module zip
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: ./build-zip.sh
 
       - name: Rename artifact with commit / tag
