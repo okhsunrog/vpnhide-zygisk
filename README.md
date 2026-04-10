@@ -147,6 +147,41 @@ list in the Kotlin companion module.
   The app sees an empty slot at that index and moves on.
 - Any other request passes through unchanged.
 
+## Known limitations
+
+- **Direct syscalls bypass the hook.** We patch `libc.so!ioctl`, so any
+  code that issues `syscall(SYS_ioctl, …)` directly (or a hand-rolled
+  `svc #0` in assembly) goes straight to the kernel without touching our
+  trampoline. Rare in normal apps, common in deliberate anti-hook code.
+- **`ioctl` is only one of several detection paths.** Apps can enumerate
+  interfaces via `getifaddrs()` / `freeifaddrs()` (Dart VM's
+  `NetworkInterface.list()` uses this), `ioctl(SIOCGIFCONF)` bulk queries,
+  or raw `NETLINK_ROUTE` sockets read via `recvmsg`. None of these are
+  hooked yet — see the "Planned" list in the Status section. An app that
+  uses any of these will still see `tun0` / `wg0` / etc.
+- **Java-level detection is out of scope.** `ConnectivityManager.getNetworkCapabilities(…).hasTransport(TRANSPORT_VPN)`,
+  `NetworkInterface.getNetworkInterfaces()`, and similar ART-side APIs
+  are handled by the [Kotlin LSPosed companion module `vpnhide`](https://github.com/okhsunrog/vpnhide).
+  You almost always want both modules installed together.
+- **NeoZygisk / Zygisk API v5 only.** The `zygisk-api` crate is pinned to
+  the V5 shape. Legacy Magisk-Zygisk (v1–v4) is not supported; use
+  NeoZygisk or a KernelSU-Next build that ships it.
+- **arm64 only.** `aarch64-linux-android` is the only supported target.
+  `build.rs` hard-fails on other architectures; no 32-bit arm, no x86.
+- **Tested only on Android 16 (API 36).** Should work back to the
+  `android-24` link target in principle, but nothing older has been
+  exercised. The shadowhook linker-hook workaround in our fork was
+  specifically motivated by API 36; older versions may or may not need it.
+- **Verbose logcat in release builds.** Pre/post-specialize and
+  `is_targeted` decisions are logged at `I` level in every build, so
+  `logcat | grep vpnhide-zygisk` is noisy. Fine for debugging, less so
+  for long-term deployment.
+- **Built-in allowlist hardcodes `ru.plazius.shokoladnica`.** The primary
+  use case that drove this module is baked into `is_targeted()` as a
+  fallback so the module works out-of-the-box for the author. If you fork
+  this for a different target app, edit `src/lib.rs` or rely purely on
+  `targets.txt`.
+
 ## Uninstall
 
 KernelSU-Next manager → Modules → VPN Hide (Zygisk native) → Remove.
