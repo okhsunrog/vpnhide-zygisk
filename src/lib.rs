@@ -121,7 +121,13 @@ impl ZygiskModule for VpnHide {
             return;
         }
         match install_hooks() {
-            Ok(()) => info!("hooks installed (inline libc!ioctl)"),
+            Ok(()) => {
+                info!("hooks installed (inline libc!ioctl + getifaddrs)");
+                // Erase shadowhook's fingerprints from /proc/self/maps
+                // before any anti-tamper SDK (e.g. MIR HCE) gets a
+                // chance to scan them via raw syscalls.
+                scrub_shadowhook_maps();
+            }
             Err(err) => error!("install_hooks failed: {err}"),
         }
     }
@@ -187,6 +193,84 @@ fn hook_libc_sym(
     }
     store_orig(orig as *const ());
     Ok(())
+}
+
+// ============================================================================
+//  Anti-detection: scrub shadowhook fingerprints from /proc/self/maps
+// ============================================================================
+
+/// After shadowhook installs inline hooks it leaves two named anonymous
+/// memory regions visible in `/proc/self/maps`:
+///
+///   - `[anon:shadowhook-island]`  — trampoline island
+///   - `[anon:shadowhook-enter]`   — hook entry stubs
+///
+/// Anti-tamper SDKs (notably MIR HCE from NSPK, used in Russian banking
+/// apps) read `/proc/self/maps` via raw `svc #0` syscalls — completely
+/// bypassing any libc hook we could place — and scan for known hooking
+/// framework names. If they see "shadowhook" they abort the process.
+///
+/// Fix: rename those regions to an empty string via `prctl(PR_SET_VMA,
+/// PR_SET_VMA_ANON_NAME, ...)`. The kernel updates the name in its VMA
+/// metadata, so subsequent reads of `/proc/self/maps` (via any path,
+/// including raw syscalls) will show a plain `[anon:]` entry,
+/// indistinguishable from the hundreds of other anonymous mappings in
+/// any Android process.
+///
+/// Must be called immediately after `install_hooks()` — before the app's
+/// ContentProviders are initialized (which is where MIR SDK runs).
+fn scrub_shadowhook_maps() {
+    let names_to_scrub: &[&str] = &["shadowhook-island", "shadowhook-enter"];
+    let maps = match fs::read_to_string("/proc/self/maps") {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("scrub_shadowhook_maps: can't read /proc/self/maps: {e}");
+            return;
+        }
+    };
+
+    for line in maps.lines() {
+        // Format: "start-end perms offset dev inode  pathname"
+        // For named anon regions: "7ff152000-7ff153000 ... [anon:shadowhook-island]"
+        let should_scrub = names_to_scrub
+            .iter()
+            .any(|name| line.contains(&format!("[anon:{name}]")));
+        if !should_scrub {
+            continue;
+        }
+
+        // Parse the start-end addresses from the first column.
+        let Some(range) = line.split_whitespace().next() else { continue };
+        let Some((start_hex, end_hex)) = range.split_once('-') else { continue };
+        let Ok(start) = usize::from_str_radix(start_hex, 16) else { continue };
+        let Ok(end) = usize::from_str_radix(end_hex, 16) else { continue };
+        let len = end.saturating_sub(start);
+        if len == 0 {
+            continue;
+        }
+
+        // PR_SET_VMA = 0x53564d41, PR_SET_VMA_ANON_NAME = 0
+        // prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, len, name)
+        // Setting name to an empty C string "" makes the region show as
+        // plain "[anon:]" in maps.
+        let rc = unsafe {
+            libc::prctl(
+                0x53564d41_u32 as libc::c_int, // PR_SET_VMA
+                0,                              // PR_SET_VMA_ANON_NAME
+                start,
+                len,
+                c"".as_ptr(),
+            )
+        };
+        if rc == 0 {
+            debug!("scrubbed anon region at {start_hex}-{end_hex}");
+        } else {
+            log::warn!(
+                "prctl(PR_SET_VMA_ANON_NAME) failed for {start_hex}-{end_hex}: errno={}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 /// Is this package on our allowlist?
