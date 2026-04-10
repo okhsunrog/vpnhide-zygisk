@@ -15,17 +15,26 @@ against `ru.plazius.shokoladnica` (the Flutter-based cafe loyalty app that
 motivated this module): the VPN-detection banner no longer appears when a
 WireGuard tunnel is active.
 
-Current coverage:
+Current coverage (all hooks are inline on `libc.so`):
 - `ioctl(SIOCGIFFLAGS)` — pre-screened; returns `-1 ENODEV` if the caller
   hands us an `ifr_name` matching a VPN prefix.
 - `ioctl(SIOCGIFNAME)` — called through; if the returned name is a VPN,
   rewritten to `-1 ENODEV`.
 - Any other `ioctl` request: passthrough.
+- `getifaddrs` — called through; VPN entries are unlinked from the
+  returned linked list before it reaches the caller. This catches
+  `NetworkInterface.getNetworkInterfaces()` inside libcore, Dart's
+  `NetworkInterface.list()`, and any direct C/C++ call.
 
 Planned:
-- `getifaddrs` / `freeifaddrs` filter (Dart VM's `NetworkInterface.list()`).
+- `openat`/`open` filter on `/proc/net/route`, `/proc/net/tcp`,
+  `/proc/net/tcp6`, `/proc/net/dev` — catches native readers of the
+  networking procfs entries that bypass the LSPosed companion's
+  `java.io.File` constructor hooks.
 - `ioctl(SIOCGIFCONF)` bulk-query filter.
 - `recvmsg` filter on `NETLINK_ROUTE` sockets.
+- Optional: `connect()` filter on localhost proxy ports, to defeat
+  YourVPNDead-style SOCKS5 port probing.
 
 ## Architecture
 

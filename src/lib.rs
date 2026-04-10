@@ -39,7 +39,9 @@ use zygisk_api::ZygiskModule;
 use zygisk_api::api::v5::{AppSpecializeArgs, V5, ZygiskOption};
 use zygisk_api::api::ZygiskApi;
 
-use crate::hooks::{hooked_ioctl, set_real_ioctl_ptr};
+use crate::hooks::{
+    hooked_getifaddrs, hooked_ioctl, set_real_getifaddrs_ptr, set_real_ioctl_ptr,
+};
 
 const LOG_TAG: &str = "vpnhide-zygisk";
 const TARGETS_FILE: &str = "/data/adb/modules/vpnhide_zygisk/targets.txt";
@@ -130,34 +132,56 @@ fn mark_cleanup(api: &mut ZygiskApi<'_, V5>) {
     api.set_option(ZygiskOption::DlCloseModuleLibrary);
 }
 
-/// Install an inline hook on `libc.so!ioctl` via ByteDance shadowhook.
+/// Install inline hooks on `libc.so` via ByteDance shadowhook. We patch
+/// two entry points:
+///
+///   * `ioctl`       — catches `SIOCGIFNAME` / `SIOCGIFFLAGS` interface
+///                     probes from native code.
+///   * `getifaddrs`  — catches the higher-level interface enumeration
+///                     API used by `NetworkInterface.getNetworkInterfaces()`
+///                     inside libcore, by the Dart VM's
+///                     `NetworkInterface.list()`, and by anything in C/C++
+///                     that calls `getifaddrs()` directly.
 ///
 /// This replaces the earlier PLT-hook approach. PLT hooks can only patch
 /// callers that are already mapped at `post_app_specialize` time — which
 /// excludes `libflutter.so`/`libapp.so` and any other library loaded later
-/// via `dlopen`. Inline-hooking libc's `ioctl` entry point itself catches
+/// via `dlopen`. Inline-hooking libc's entry points themselves catches
 /// every caller regardless of load order.
 fn install_hooks() -> Result<(), String> {
     shadowhook::init_once().map_err(|rc| format!("shadowhook_init: rc={rc}"))?;
 
+    hook_libc_sym(c"ioctl", hooked_ioctl as *mut _, set_real_ioctl_ptr)?;
+    hook_libc_sym(c"getifaddrs", hooked_getifaddrs as *mut _, set_real_getifaddrs_ptr)?;
+
+    Ok(())
+}
+
+/// Install a single inline hook on a libc symbol and stash the original
+/// trampoline via `store_orig`. Used for every entry point from
+/// `install_hooks`.
+fn hook_libc_sym(
+    sym: &core::ffi::CStr,
+    new_fn: *mut core::ffi::c_void,
+    store_orig: fn(*const ()),
+) -> Result<(), String> {
     let mut orig: *mut core::ffi::c_void = core::ptr::null_mut();
-    // SAFETY: `hooked_ioctl` is ABI-compatible with libc `ioctl`; `orig`
-    // is a valid writable pointer.
-    let stub = unsafe {
-        shadowhook::hook_sym(
-            c"libc.so",
-            c"ioctl",
-            hooked_ioctl as *mut core::ffi::c_void,
-            &mut orig,
-        )
-    };
+    // SAFETY: `new_fn` has an ABI-compatible signature with the target
+    // libc symbol; `&mut orig` is a valid writable pointer.
+    let stub = unsafe { shadowhook::hook_sym(c"libc.so", sym, new_fn, &mut orig) };
     if stub.is_null() {
-        return Err("shadowhook_hook_sym_name(libc.so, ioctl) returned null".into());
+        return Err(format!(
+            "shadowhook_hook_sym_name(libc.so, {}) returned null",
+            sym.to_string_lossy()
+        ));
     }
     if orig.is_null() {
-        return Err("shadowhook returned null original trampoline".into());
+        return Err(format!(
+            "shadowhook returned null trampoline for libc.so!{}",
+            sym.to_string_lossy()
+        ));
     }
-    set_real_ioctl_ptr(orig as *const ());
+    store_orig(orig as *const ());
     Ok(())
 }
 

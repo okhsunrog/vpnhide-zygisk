@@ -148,3 +148,89 @@ pub unsafe extern "C" fn hooked_ioctl(
     // Anything else: pass through unmodified.
     unsafe { real(fd, request, arg) }
 }
+
+// ============================================================================
+//  Hook: getifaddrs
+// ============================================================================
+
+/// Pointer to the real `getifaddrs`, captured at install time.
+static REAL_GETIFADDRS: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+
+type GetifaddrsFn = unsafe extern "C" fn(*mut *mut libc::ifaddrs) -> c_int;
+
+#[inline(always)]
+fn real_getifaddrs() -> Option<GetifaddrsFn> {
+    let raw = REAL_GETIFADDRS.load(Ordering::Relaxed);
+    if raw.is_null() {
+        None
+    } else {
+        // SAFETY: we only ever store a valid `getifaddrs` pointer in this
+        // slot via `set_real_getifaddrs_ptr`.
+        Some(unsafe { core::mem::transmute::<*mut c_void, GetifaddrsFn>(raw) })
+    }
+}
+
+/// Stash the trampoline returned by shadowhook for `libc.so!getifaddrs`.
+pub fn set_real_getifaddrs_ptr(p: *const ()) {
+    REAL_GETIFADDRS.store(p as *mut c_void, Ordering::Relaxed);
+}
+
+/// Replacement for `libc::getifaddrs`.
+///
+/// Calls the real `getifaddrs`, then walks the returned linked list and
+/// unlinks every entry whose `ifa_name` matches a VPN prefix. The caller
+/// still calls `freeifaddrs` on the head pointer we return; it walks only
+/// via `ifa_next`, so unlinked (VPN) nodes are leaked — a handful of
+/// ~200-byte `struct ifaddrs` per `getifaddrs` call, which is acceptable
+/// in exchange for not having to track a per-allocation shadow list. We
+/// do not hook `freeifaddrs` for this reason.
+///
+/// Covers:
+/// * native callers of `getifaddrs` directly from C/C++/NDK code;
+/// * the Android libcore path: `java.net.NetworkInterface.getNetworkInterfaces()`
+///   internally calls `getifaddrs` through a JNI shim (`Libcore.os`), so
+///   this hook also catches Kotlin/Java apps if for some reason the
+///   Java-level LSPosed hook didn't fire first.
+///
+/// # Safety
+///
+/// Called from native code. `ifap` is a valid out-pointer the caller
+/// owns; on success the real `getifaddrs` fills it with a pointer to a
+/// caller-owned linked list that we are free to mutate before returning.
+pub unsafe extern "C" fn hooked_getifaddrs(ifap: *mut *mut libc::ifaddrs) -> c_int {
+    let Some(real) = real_getifaddrs() else {
+        set_errno(libc::EFAULT);
+        return -1;
+    };
+
+    let rc = unsafe { real(ifap) };
+    if rc != 0 || ifap.is_null() {
+        return rc;
+    }
+
+    // Walk the list using a "previous next-pointer slot" cursor so
+    // unlinking the head works the same as unlinking an interior node.
+    // `slot` always points at the ifa_next field (or the out-pointer *ifap
+    // on the first iteration) whose value is the current entry.
+    let mut slot: *mut *mut libc::ifaddrs = ifap;
+    unsafe {
+        while !(*slot).is_null() {
+            let entry = *slot;
+            let name_ptr = (*entry).ifa_name;
+            let is_vpn = if name_ptr.is_null() {
+                false
+            } else {
+                let name = core::ffi::CStr::from_ptr(name_ptr);
+                crate::filter::is_vpn_iface_cstr(name)
+            };
+            if is_vpn {
+                *slot = (*entry).ifa_next;
+                // `entry` is intentionally leaked; see the doc comment.
+            } else {
+                slot = &mut (*entry).ifa_next;
+            }
+        }
+    }
+
+    rc
+}
