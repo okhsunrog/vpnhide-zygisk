@@ -61,6 +61,57 @@ checkers see the VPN exit IP and flag a mismatch with GeoIP / ASN
 databases. That's a network-layer fact, not something any client-side
 hook can fix.
 
+### Source: official VPN/Proxy detection methodology
+
+Both detection apps above implement the **official Russian Ministry
+of Digital Development methodology for identifying VPN/Proxy on user
+devices**, published as an OCR'd Markdown copy here:
+<https://t.me/ruitunion/893>. The native Android sections (6.4 / 7.4
+/ 7.6 / 8.5) are the canonical reference for which libc / kernel
+interfaces this module hooks and why.
+
+### TODO — methodology coverage gaps (native side)
+
+The methodology mentions native paths that we don't yet hook. None of
+them are triggered by Шоколадница, RKNHardering or YourVPNDead today
+(they're all Java-only callers, so the LSPosed companion already
+covers them at the ART layer), but the gaps matter for any future
+detector that drops into C/C++ / NDK code to bypass ART. Listed by
+descending priority:
+
+- [ ] **`open` / `openat` filter for `/proc/net/route`, `/proc/net/tcp`,
+      `/proc/net/tcp6`, `/proc/net/udp`, `/proc/net/udp6`,
+      `/proc/net/dev`, `/proc/net/arp`, `/proc/net/fib_trie*`** —
+      sec. 7.4 / 7.6 / 7.7 / 7.8. Java-side `FileInputStream` /
+      `FileReader` constructors are already redirected to `/dev/null`
+      by the LSPosed companion, but a native caller (Flutter, JNI)
+      reaches procfs through libc directly. Plan: replace the fd with
+      a memfd containing a sanitized version of the file (drop routes
+      via VPN ifaces, drop TCP entries on known proxy ports), or fall
+      back to redirecting to `/dev/null` if sanitizing turns out
+      fragile.
+- [ ] **`ioctl(SIOCGIFCONF)` bulk-query filter** — sec. 6.4. Currently
+      passthrough; we only handle `SIOCGIFNAME` / `SIOCGIFFLAGS`.
+      `SIOCGIFCONF` returns the whole interface table in one shot, so
+      a Flutter app calling it from Dart bypasses our per-name filter
+      entirely.
+- [ ] **`recvmsg` filter on `NETLINK_ROUTE` sockets** — sec. 7.6.
+      Apps that read the routing table via netlink instead of
+      `/proc/net/route` would slip past the procfs hook. Lower
+      priority — netlink usage from Android user code is rare.
+- [ ] **`connect()` filter for localhost proxy ports** — sec. 7.8.
+      The methodology lists "active connections to non-standard
+      ports" as a Proxy sign, and YourVPNDead probes 127.0.0.1 on
+      10808 / 7890 / 9050 / 9090 / etc. Risky to hook indiscriminately
+      (breaks legitimate localhost services), so target-app-scoped
+      and port-allowlisted only.
+
+The complementary Java side
+(`ConnectivityManager` / `NetworkCapabilities` / `NetworkInterface` /
+`LinkProperties` / `System.getProperty` / `NetworkCapabilities.toString`
+/ Java-side `/proc/net/*` constructor redirects) is the responsibility
+of [vpnhide](https://github.com/okhsunrog/vpnhide), not this module.
+
 Current coverage (all hooks are inline on `libc.so`):
 - `ioctl(SIOCGIFFLAGS)` — pre-screened; returns `-1 ENODEV` if the caller
   hands us an `ifr_name` matching a VPN prefix.
